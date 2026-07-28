@@ -88,6 +88,8 @@ class APIServer(TikTok):
         self.background_downloader: Optional[BackgroundDownloader] = None
         self.data_recorder: Optional[DataRecorder] = None
         self.thumbnail_generator = ThumbnailGenerator(self._log_print)
+        # 缩略图后台任务集合，保持引用避免被 GC 中断
+        self._thumbnail_tasks: set = set()
 
     def _log_print(self, text: str, style: str = "INFO"):
         try:
@@ -203,10 +205,9 @@ class APIServer(TikTok):
         record_data = self._map_to_record(data, request.url)
         await self.data_recorder.add(**record_data)
 
-        # 补全文件访问信息
-        file_paths = record_data.get("下载文件路径", [])
-        if file_paths:
-            data["文件访问信息"] = self.convert_file_paths_to_urls(file_paths)
+        # 补全文件访问信息（自愈：若下载文件路径为空，扫描 Download 目录）
+        data["下载文件路径"] = record_data.get("下载文件路径", "[]")
+        await self._populate_file_access_info(data)
 
         return {"message": _("获取作品数据成功"), "data": data}
 
@@ -780,19 +781,13 @@ class APIServer(TikTok):
         }
 
     def _resolve_downloaded_files(self, data: dict) -> list:
-        """下载完成后，根据命名规则扫描实际下载的文件路径"""
+        """下载完成后，根据命名规则扫描实际下载的文件路径
+
+        data 为 extractor 产出的原始格式（键：id/desc/create_time/nickname/uid/type）。
+        """
         try:
-            root = self.parameter.root.joinpath(self.parameter.folder_name)
-            if not root.exists():
-                return []
             name = self.downloader.generate_detail_name(data)
-            matched = sorted(f for f in root.glob(f"{name}*") if f.is_file())
-            media_exts = {
-                ".mp4", ".mov", ".avi", ".mkv", ".webm",
-                ".jpg", ".jpeg", ".png", ".webp", ".avif", ".heic",
-                ".gif", ".live", ".mp3",
-            }
-            return [str(f) for f in matched if f.suffix.lower() in media_exts]
+            return self._scan_by_name(name)
         except Exception:
             return []
 
@@ -800,7 +795,11 @@ class APIServer(TikTok):
         """为作品数据填充文件访问信息
 
         当"下载文件路径"为空时，扫描 Download 目录匹配已下载的文件，
-        找到后回填数据并异步更新数据库。
+        找到后回填数据并异步更新数据库（自愈机制）。
+        list / detail / get_detail 接口共用。
+
+        额外自愈：若文件列表中包含视频但 Temp 目录缺对应缩略图，
+        后台异步生成，不阻塞当前响应。
         """
         try:
             file_paths = data.get("下载文件路径", [])
@@ -823,11 +822,66 @@ class APIServer(TikTok):
 
             if file_paths:
                 data["文件访问信息"] = self.convert_file_paths_to_urls(file_paths)
+                # 视频缩略图自愈：缺失则后台生成
+                self._ensure_video_thumbnails(file_paths)
         except Exception:
             pass
 
+    def _ensure_video_thumbnails(self, file_paths: list) -> None:
+        """检查视频文件是否有对应缩略图，缺失则后台异步生成
+
+        缩略图路径：Volume/Temp/<视频文件名>.jpg
+        - 已存在：跳过
+        - 缺失：create_task 后台生成（用 to_thread 避免 cv2 阻塞事件循环）
+        生成失败不影响主流程。
+        """
+        import asyncio
+
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        temp_dir = self.parameter.ROOT / "Temp"
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+
+        for fp in file_paths:
+            try:
+                p = Path(fp)
+                if p.suffix.lower() not in video_exts or not p.exists():
+                    continue
+                thumb = temp_dir / (p.stem + ".jpg")
+                if thumb.exists():
+                    continue
+                # 后台异步生成，不阻塞当前响应
+                task = asyncio.create_task(
+                    self._generate_thumbnail_async(p, temp_dir)
+                )
+                self._thumbnail_tasks.add(task)
+                task.add_done_callback(self._thumbnail_tasks.discard)
+            except Exception:
+                continue
+
+    async def _generate_thumbnail_async(self, video_path: Path, temp_dir: Path) -> None:
+        """异步生成缩略图（包装同步 cv2 调用）"""
+        import asyncio
+        try:
+            result = await asyncio.to_thread(
+                self.thumbnail_generator.generate_video_thumbnail,
+                video_path,
+                temp_dir,
+            )
+            if result:
+                self.logger.info(f"已生成缩略图: {result.name}")
+            else:
+                self.logger.warning(f"缩略图生成失败: {video_path.name}")
+        except Exception as e:
+            self.logger.warning(f"生成缩略图异常 {video_path.name}: {e}")
+
     def _scan_download_files(self, data: dict) -> list:
-        """扫描 Download 目录，匹配已下载的文件"""
+        """扫描 Download 目录，匹配已下载的文件
+
+        data 为中文键格式（DataRecorder 记录），内部映射为 extractor 原始键后生成文件名。
+        """
         try:
             mapped = {
                 "id": data.get("作品ID", ""),
@@ -838,16 +892,43 @@ class APIServer(TikTok):
                 "type": data.get("作品类型", ""),
             }
             name = self.downloader.generate_detail_name(mapped)
-            search_dir = self.parameter.root.joinpath(self.parameter.folder_name)
-            if not search_dir.exists():
+            return self._scan_by_name(name)
+        except Exception:
+            return []
+
+    def _scan_by_name(self, name: str) -> list:
+        """按文件名前缀扫描 Download 目录（支持 folder_mode 作者子目录）
+
+        - folder_mode=False：搜索 Download/<name>*
+        - folder_mode=True：额外搜索 Download/<name>/<name>*（作品独立子目录）
+        过滤非媒体文件（如 .db、.tmp）。
+        """
+        try:
+            if not name:
                 return []
-            matched = sorted(f for f in search_dir.glob(f"{name}*") if f.is_file())
+            search_root = self.parameter.root.joinpath(self.parameter.folder_name)
+            if not search_root.exists():
+                return []
+            candidates = []
+            # 根目录匹配
+            for f in search_root.glob(f"{name}*"):
+                if f.is_file():
+                    candidates.append(f)
+            # folder_mode：作品独立子目录
+            if getattr(self.parameter, "folder_mode", False):
+                sub_dir = search_root.joinpath(name)
+                if sub_dir.exists():
+                    for f in sub_dir.glob(f"{name}*"):
+                        if f.is_file():
+                            candidates.append(f)
             media_exts = {
                 ".mp4", ".mov", ".avi", ".mkv", ".webm",
                 ".jpg", ".jpeg", ".png", ".webp", ".avif", ".heic",
                 ".gif", ".live", ".mp3",
             }
-            return [str(f) for f in matched if f.suffix.lower() in media_exts]
+            return [
+                str(f) for f in sorted(candidates) if f.suffix.lower() in media_exts
+            ]
         except Exception:
             return []
 
