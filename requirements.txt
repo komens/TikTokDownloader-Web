@@ -19,6 +19,7 @@ openpyxl==3.1.5
 pydantic==2.13.4
     # via tiktok-downloader-web (pyproject.toml)
 pyperclip==1.11.0
+python-multipart==0.0.32
     # via tiktok-downloader-web (pyproject.toml)
 qrcode==8.2
     # via tiktok-downloader-web (pyproject.toml)

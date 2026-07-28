@@ -173,6 +173,8 @@ class APIServer(TikTok):
         app.get("/douyin/list", tags=["抖音"])(self._route_list)
         app.get("/douyin/detail/{work_id}", tags=["抖音"])(self._route_get_detail)
         app.delete("/douyin/delete/{work_id}", tags=["抖音"])(self._route_delete)
+        app.get("/douyin/export", tags=["抖音"])(self._route_export)
+        app.post("/douyin/import", tags=["抖音"])(self._route_import)
         app.get("/douyin/queue", tags=["下载队列"])(self._route_get_queue)
         app.delete("/douyin/queue/{work_id}", tags=["下载队列"])(
             self._route_delete_queue
@@ -447,6 +449,125 @@ class APIServer(TikTok):
             "message": _("删除作品数据成功"),
             "deleted_files": deleted_files if delete_files else None,
         }
+
+    # ---------- 导出 / 导入 ----------
+
+    async def _route_export(self):
+        """导出配置和数据为 zip 文件
+
+        打包 Volume 目录下的所有 .db 和 .json 文件：
+        - settings.json
+        - download_queue.json
+        - DouK-Downloader.db
+        - ExploreData.db
+        """
+        root = self.parameter.ROOT
+        buffer = BytesIO()
+        with ZipFile(buffer, "w", ZIP_DEFLATED) as zf:
+            for name in (
+                "settings.json",
+                "download_queue.json",
+                "DouK-Downloader.db",
+                "ExploreData.db",
+            ):
+                target = root.joinpath(name)
+                if target.exists() and target.is_file():
+                    zf.write(target, name)
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=douyin_data_export.zip"
+            },
+        )
+
+    async def _route_import(self, file: UploadFile = File(...)):
+        """导入配置和数据 zip 文件
+
+        覆盖 Volume 目录下的 settings.json / download_queue.json /
+        DouK-Downloader.db / ExploreData.db，并重连数据库、重置队列状态。
+        """
+        if not file.filename or not file.filename.endswith(".zip"):
+            return {"message": _("请上传 zip 格式的文件")}
+
+        root = self.parameter.ROOT
+        content = await file.read()
+        buffer = BytesIO(content)
+        allowed = {
+            "settings.json",
+            "download_queue.json",
+            "DouK-Downloader.db",
+            "ExploreData.db",
+        }
+
+        async def _close_db():
+            """关闭两个数据库连接"""
+            try:
+                if self.data_recorder:
+                    await self.data_recorder.__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                if self.database:
+                    await self.database.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+        async def _reopen_db():
+            """重新连接两个数据库"""
+            try:
+                if self.data_recorder:
+                    await self.data_recorder.__aenter__()
+            except Exception as e:
+                self.logger.warning(f"重连 data_recorder 失败: {e}")
+            try:
+                if self.database:
+                    await self.database.__aenter__()
+            except Exception as e:
+                self.logger.warning(f"重连 database 失败: {e}")
+
+        extracted = []
+        try:
+            with ZipFile(buffer, "r") as zf:
+                # 关闭当前数据库连接，避免文件占用
+                await _close_db()
+
+                # 遍历 zip 内文件，用 basename 匹配白名单
+                # （兼容 zip 内带目录前缀的情况）
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    basename = Path(info.filename).name
+                    if basename not in allowed:
+                        continue
+                    # 直接读取内容写入目标路径，避免 extract 保留目录结构
+                    target = root.joinpath(basename)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    extracted.append(basename)
+                    self.logger.info(f"导入文件: {basename}")
+
+                # 重新连接数据库
+                await _reopen_db()
+
+            # 重置队列中下载中断的任务状态
+            if self.queue_manager:
+                self.queue_manager.reset_downloading_tasks()
+
+            if not extracted:
+                return {
+                    "message": _("未在 zip 中找到可导入的文件（需包含 settings.json / download_queue.json / DouK-Downloader.db / ExploreData.db）"),
+                }
+            return {
+                "message": _("导入数据成功，共 {count} 个文件").format(count=len(extracted)),
+                "files": extracted,
+            }
+        except Exception as e:
+            # 异常时确保重新连接数据库
+            await _reopen_db()
+            self.logger.error(f"导入数据失败: {e}")
+            return {"message": _("导入数据失败：{error}").format(error=e)}
 
     # ---------- 队列 ----------
 
