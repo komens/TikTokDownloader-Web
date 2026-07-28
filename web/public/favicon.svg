@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#161823;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2d2f3e;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <!-- 背景圆（黑） -->
+  <circle cx="50" cy="50" r="45" fill="url(#grad)"/>
+  <!-- 下载箭头 -->
+  <path d="M50 20 L50 55 M30 45 L50 65 L70 45" stroke="#ffffff" stroke-width="8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 底部横线 -->
+  <line x1="25" y1="80" x2="75" y2="80" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+</svg>
